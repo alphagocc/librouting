@@ -3062,6 +3062,7 @@ impl DefaultRouter {
                 }
             }
         }
+        desired.retain(|route| peer.communities_allow_export(route));
         let current = self.adj_rib_out.paths_for(
             RouteOrigin {
                 proto: 0,

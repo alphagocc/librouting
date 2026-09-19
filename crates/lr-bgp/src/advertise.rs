@@ -34,11 +34,24 @@ use lr_core::nlri::NlriFamily;
 use lr_core::rib::Route;
 
 impl BgpPeer {
+    /// Whether standard communities permit export to this session.
+    pub fn communities_allow_export(&self, route: &Route) -> bool {
+        let attrs: PathAttributes = route.attributes.clone().into();
+        !(attrs.has_community(Community::NO_ADVERTISE)
+            || (self.cfg.peer_role() == crate::role::PeerRole::Ebgp
+                && attrs.has_community(Community::NO_EXPORT))
+            || (self.cfg.peer_role().is_external()
+                && attrs.has_community(Community::NO_EXPORT_SUBCONFED)))
+    }
+
     /// Advertise a route to this peer. Applies egress rules, encodes the
     /// UPDATE and appends it to the outbound buffer. Returns `false` (and
     /// sends nothing) when the route is not advertisable to this peer —
     /// e.g. an iBGP-learned route to a non-client iBGP peer.
     pub fn advertise(&mut self, route: &Route) -> bool {
+        if !self.communities_allow_export(route) {
+            return false;
+        }
         if !self.is_established() {
             return false;
         }

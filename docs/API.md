@@ -55,6 +55,10 @@ assert!(topo.rr_client);
 assert_eq!(topo.role, PeerRole::Ibgp);
 ```
 
+`BgpPeer::communities_allow_export(&route)` checks the session's RFC 1997
+`NO_ADVERTISE`, `NO_EXPORT`, and `NO_EXPORT_SUBCONFED` limits before a route
+is included in the desired advertisements, including confederation boundaries.
+
 ## BGP — best-path
 
 ```rust
