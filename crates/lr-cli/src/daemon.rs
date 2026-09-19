@@ -844,7 +844,7 @@ fn run_bgp_daemon(cfg: &DaemonConfig, rid: RouterId, host: Option<EngineHost>) -
                 .unwrap_or(lr_bgp::rtr::client::DEFAULT_EXPIRE_INTERVAL)
         );
     }
-    if cfg.roa_validate && !roa_store.is_empty() {
+    if cfg.roa_validate {
         // Install a built-in import hook that drops Invalid routes
         // (or warns + accepts them) before the user-supplied chain.
         // Implemented as a tiny DSL filter so the same code path
