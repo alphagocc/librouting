@@ -3006,12 +3006,16 @@ impl DefaultRouter {
     /// wire — callers transmit the returned work after restoring the
     /// hook chain (the borrow split forces this two-phase shape).
     fn export_work_for(
-        &self,
+        &mut self,
         hooks: &HookChain,
         session: u64,
         key: &RouteKey,
         ranked: &[Route],
     ) -> (Vec<Route>, Vec<u32>) {
+        // This decision replaces any queued advertisement, including a no-op.
+        if let Some(state) = self.mrai.get_mut(&session) {
+            state.pending.remove(key);
+        }
         let Some(SessionState::Bgp { peer, .. }) = self.sessions.get(&session) else {
             return (Vec::new(), Vec::new());
         };
@@ -3092,6 +3096,10 @@ impl DefaultRouter {
     /// bytes so a policy update is reflected immediately. Entries no longer
     /// permitted by policy are withdrawn before the refreshed advertisements.
     fn reannounce_to_session(&mut self, session: u64, family: NlriFamily) {
+        // A refreshed family supersedes queued updates under the old policy.
+        if let Some(state) = self.mrai.get_mut(&session) {
+            state.pending.retain(|key, _| key.family != family);
+        }
         let origin = RouteOrigin {
             proto: 0,
             peer: session,
