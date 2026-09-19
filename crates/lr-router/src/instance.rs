@@ -2851,6 +2851,7 @@ impl DefaultRouter {
     /// Loc-RIB; Add-Path peers receive every path while single-path peers
     /// continue to see only the head of the set.
     fn reselect(&mut self, key: &RouteKey) {
+        // Runtime publications retain each adjacency's current candidate.
         let candidates: Vec<Route> = self
             .adj_rib_in
             .iter_all()
@@ -2858,6 +2859,11 @@ impl DefaultRouter {
             .cloned()
             .chain(self.originated.values().filter(|r| r.key == *key).cloned())
             .chain(self.direct_rib.values().filter(|r| r.key == *key).cloned())
+            .chain(self.ospf_published.get(key).cloned())
+            .chain(self.sessions.values().filter_map(|state| match state {
+                SessionState::Babel { runtime, .. } => runtime.published.get(key).cloned(),
+                _ => None,
+            }))
             .collect();
 
         let ranked: Vec<Route> = if candidates.is_empty() {
@@ -4235,6 +4241,7 @@ impl RouterInstance for DefaultRouter {
     }
 
     fn remove_session(&mut self, h: SessionHandle) -> Result<(), String> {
+        self.babel_flush_session(h);
         // Remember the OSPF area before the session goes away so the last
         // session of an area can tear its shared LSDB down.
         let ospf_area = match self.sessions.get(&h.0) {
@@ -4821,16 +4828,17 @@ impl DefaultRouter {
     /// so the best path falls out of the full preference order (BGP 20 <
     /// OSPF 110 < Babel 120) and a withdrawal from either side falls back
     /// to the other's contribution. Keys with no BGP side keep the
-    /// historical direct-install behaviour (single-path `install` + event)
-    /// — exactly what a single-protocol OSPF/Babel daemon sees today.
+    /// direct-install behaviour for OSPF (single-path `install` + event).
+    /// Babel always selects from the live adjacency publications.
     fn apply_runtime_delta(&mut self, delta: RuntimeDelta) {
         for route in delta.installed {
             let key = route.key.clone();
             self.direct_rib.insert(key.clone(), route.clone());
-            let bgp_side = self.adj_rib_in.iter_all().any(|r| r.key == key)
+            let needs_selection = route.protocol == Protocol::Babel
+                || self.adj_rib_in.iter_all().any(|r| r.key == key)
                 || self.originated.contains_key(&key)
                 || self.redistributed_bgp.contains_key(&key);
-            if bgp_side {
+            if needs_selection {
                 self.reselect(&key);
             } else {
                 self.loc_rib.install(route.clone());
@@ -4862,8 +4870,7 @@ impl DefaultRouter {
                 // (or uninstalls the key when none is left).
                 self.reselect(&key);
             } else {
-                self.loc_rib.uninstall(&key);
-                self.pending_events.push(RouterEvent::RouteWithdrawn(key));
+                self.reselect(&key);
             }
         }
     }
@@ -11276,6 +11283,210 @@ mod tests {
     }
 
     // ===== rc.3 shared Loc-RIB: BGP + protocol-direct contributions =====
+
+    fn babel_selection_frame(neighbor: u8, metric: u16, seqno: u16) -> Vec<u8> {
+        use lr_babel::message::{Hello, NextHop, RouterId as BabelRouterId, Update};
+        use lr_babel::tlv::{Tlv, TlvType};
+
+        let frame = BabelFrame::new(vec![
+            Tlv::new(TlvType::Hello, Hello::new(seqno, 1000).encode().to_vec()),
+            // Both neighbors advertise the same originating router.
+            Tlv::new(
+                TlvType::RouterId,
+                BabelRouterId { id: [7; 8] }.encode().to_vec(),
+            ),
+            Tlv::new(
+                TlvType::NextHop,
+                NextHop {
+                    ae: 1,
+                    address: IpAddr::V4([192, 0, 2, neighbor]),
+                }
+                .encode(),
+            ),
+            Tlv::new(
+                TlvType::Update,
+                Update {
+                    ae: 1,
+                    flags: 0,
+                    prefix_len: 24,
+                    omitted: 0,
+                    interval_cs: 300,
+                    seqno,
+                    metric,
+                    prefix: vec![10, 10, 10],
+                    src_prefix_len: 0,
+                    src_prefix: Vec::new(),
+                }
+                .encode(),
+            ),
+        ]);
+        BabelCodec::new().encode_vec(&frame).unwrap()
+    }
+
+    fn babel_selection_neighbors(r: &mut DefaultRouter) -> [SessionHandle; 2] {
+        [1, 2].map(|_| {
+            r.add_session(SessionConfig::babel(IpAddr::V4([192, 0, 2, 254])))
+                .unwrap()
+        })
+    }
+
+    fn babel_selection_key() -> RouteKey {
+        RouteKey::new(
+            Prefix::new_v4([10, 10, 10, 0], 24),
+            NlriFamily::IPV4_UNICAST,
+        )
+    }
+
+    fn assert_babel_selection(r: &DefaultRouter, neighbor: u8, metric: u32) {
+        let route = r
+            .loc_rib
+            .best(&babel_selection_key())
+            .expect("route survives");
+        assert_eq!(route.protocol, Protocol::Babel);
+        assert_eq!(route.next_hop, Some(IpAddr::V4([192, 0, 2, neighbor])));
+        assert_eq!(route.preference.metric, metric);
+    }
+
+    #[test]
+    fn babel_neighbor_selection_ignores_announcement_order_and_refresh() {
+        for order in [[0, 1], [1, 0]] {
+            let mut r = DefaultRouter::new();
+            let neighbors = babel_selection_neighbors(&mut r);
+            for i in order {
+                r.feed_input(
+                    neighbors[i],
+                    &babel_selection_frame(i as u8 + 1, [10, 100][i], 1),
+                )
+                .unwrap();
+            }
+            assert_babel_selection(&r, 1, 10);
+            for i in order {
+                r.feed_input(
+                    neighbors[i],
+                    &babel_selection_frame(i as u8 + 1, [10, 100][i], 1),
+                )
+                .unwrap();
+                assert_babel_selection(&r, 1, 10);
+            }
+            // A newer sequence can worsen the former winner's metric.
+            r.feed_input(neighbors[0], &babel_selection_frame(1, 200, 2))
+                .unwrap();
+            assert_babel_selection(&r, 2, 100);
+        }
+    }
+
+    #[test]
+    fn babel_neighbor_selection_survives_either_withdrawal() {
+        for withdrawn in [0, 1] {
+            let mut r = DefaultRouter::new();
+            let neighbors = babel_selection_neighbors(&mut r);
+            r.feed_input(neighbors[1], &babel_selection_frame(2, 100, 1))
+                .unwrap();
+            r.feed_input(neighbors[0], &babel_selection_frame(1, 10, 1))
+                .unwrap();
+            let survivor = 1 - withdrawn;
+            r.feed_input(
+                neighbors[withdrawn],
+                &babel_selection_frame(withdrawn as u8 + 1, u16::MAX, 1),
+            )
+            .unwrap();
+            assert_babel_selection(&r, survivor as u8 + 1, [10, 100][survivor]);
+            r.feed_input(
+                neighbors[survivor],
+                &babel_selection_frame(survivor as u8 + 1, [10, 100][survivor] as u16, 1),
+            )
+            .unwrap();
+            assert_babel_selection(&r, survivor as u8 + 1, [10, 100][survivor]);
+            r.feed_input(
+                neighbors[survivor],
+                &babel_selection_frame(survivor as u8 + 1, u16::MAX, 1),
+            )
+            .unwrap();
+            assert!(r.loc_rib.best(&babel_selection_key()).is_none());
+        }
+    }
+
+    #[test]
+    fn babel_neighbor_selection_survives_session_removal() {
+        for removed in [0, 1] {
+            let mut r = DefaultRouter::new();
+            let neighbors = babel_selection_neighbors(&mut r);
+            r.feed_input(neighbors[1], &babel_selection_frame(2, 100, 1))
+                .unwrap();
+            r.feed_input(neighbors[0], &babel_selection_frame(1, 10, 1))
+                .unwrap();
+            r.remove_session(neighbors[removed]).unwrap();
+            let survivor = 1 - removed;
+            assert_babel_selection(&r, survivor as u8 + 1, [10, 100][survivor]);
+            r.remove_session(neighbors[survivor]).unwrap();
+            assert!(r.loc_rib.best(&babel_selection_key()).is_none());
+        }
+    }
+
+    #[test]
+    fn babel_neighbor_selection_survives_expiry() {
+        let mut r = DefaultRouter::new();
+        let neighbors = babel_selection_neighbors(&mut r);
+        r.feed_input(neighbors[1], &babel_selection_frame(2, 100, 1))
+            .unwrap();
+        r.feed_input(neighbors[0], &babel_selection_frame(1, 10, 1))
+            .unwrap();
+        r.feed_input_at(neighbors[1], &babel_selection_frame(2, 100, 1), 10_000, 0)
+            .unwrap();
+        r.babel_gc(18_001);
+        assert_babel_selection(&r, 2, 100);
+        r.babel_gc(28_001);
+        assert!(r.loc_rib.best(&babel_selection_key()).is_none());
+    }
+
+    #[test]
+    fn babel_neighbor_selection_uses_final_published_batch() {
+        let mut r = DefaultRouter::new();
+        let neighbors = babel_selection_neighbors(&mut r);
+        let mut input = babel_selection_frame(1, 10, 1);
+        input.extend(babel_selection_frame(1, u16::MAX, 1));
+        input.extend(babel_selection_frame(1, 20, 2));
+        r.feed_input(neighbors[0], &input).unwrap();
+        assert_babel_selection(&r, 1, 20);
+    }
+
+    #[test]
+    fn babel_neighbor_selection_preserves_bgp_and_ospf_candidates() {
+        let (mut r, ospf, bgp, mut remote, remote_bgp) = mixed_pair();
+        feed_direct_ospf_route(&mut r, ospf);
+        let neighbors = babel_selection_neighbors(&mut r);
+        r.feed_input(neighbors[0], &babel_selection_frame(1, 10, 1))
+            .unwrap();
+        r.feed_input(neighbors[1], &babel_selection_frame(2, 100, 1))
+            .unwrap();
+        let key = babel_selection_key();
+        assert_eq!(r.loc_rib.best(&key).unwrap().protocol, Protocol::Ospfv2);
+
+        remote.originate(key.prefix, Some(IpAddr::V4([192, 0, 2, 9])));
+        r.feed_input(bgp, &remote.drain_output(remote_bgp)).unwrap();
+        assert_eq!(r.loc_rib.best(&key).unwrap().protocol, Protocol::Bgp);
+        for i in [1, 0] {
+            r.feed_input(
+                neighbors[i],
+                &babel_selection_frame(i as u8 + 1, u16::MAX, 1),
+            )
+            .unwrap();
+            assert_eq!(r.loc_rib.best(&key).unwrap().protocol, Protocol::Bgp);
+        }
+        r.feed_input(neighbors[0], &babel_selection_frame(1, 10, 2))
+            .unwrap();
+        assert_eq!(r.loc_rib.best(&key).unwrap().protocol, Protocol::Bgp);
+        remote.unoriginate(&key);
+        r.feed_input(bgp, &remote.drain_output(remote_bgp)).unwrap();
+        assert_eq!(r.loc_rib.best(&key).unwrap().protocol, Protocol::Ospfv2);
+        flush_direct_ospf_route(&mut r, ospf);
+        assert_babel_selection(&r, 1, 10);
+        r.remove_session(neighbors[0]).unwrap();
+        assert!(
+            r.loc_rib.best(&key).is_none(),
+            "expired caches must not restore a route"
+        );
+    }
 
     /// The mixed-protocol test bed: router `a` runs one OSPFv2 area and
     /// one established eBGP session toward `b`, so the same prefix can
