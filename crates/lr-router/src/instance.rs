@@ -2434,6 +2434,25 @@ impl DefaultRouter {
     }
 
     fn import_route(&mut self, route: Route) {
+        // A replacement supersedes the old path even when admission rejects it.
+        let (origin, key, id) = (route.origin, route.key.clone(), route.path_id);
+        let previous = self.adj_rib_in.withdraw(origin, &key, id);
+        if previous.is_some() {
+            if let Some(st) = self.max_prefix_state.get_mut(&origin.peer) {
+                st.count = st.count.saturating_sub(1);
+            }
+        }
+        self.import_replacement(route);
+        if previous.is_some() && self.adj_rib_in.get(origin, &key, id).is_none() {
+            self.reselect(&key);
+            #[cfg(feature = "exchange-plane")]
+            if let Some(st) = self.exchange_plane_state.get_mut(&origin.peer) {
+                st.records.remove(&key.prefix);
+            }
+        }
+    }
+
+    fn import_replacement(&mut self, route: Route) {
         let is_ebgp = route.protocol == Protocol::Bgp && route.origin.proto == 0;
         // W6.3 exchange-plane (feature `exchange-plane`): snapshot the
         // private record store off the raw route before the admission
@@ -11728,5 +11747,170 @@ mod collision_tests {
         assert_eq!(handshake(&mut r, s2, &mut b, b_session), "Established");
         assert_eq!(r.session_peer_state(s1), Some("Established"));
         assert_eq!(r.session_peer_state(s2), Some("Established"));
+    }
+}
+
+#[cfg(test)]
+mod import_replacement_tests {
+    use super::*;
+    use lr_bgp::path::AsPath;
+    use lr_core::addr::Asn;
+    use lr_core::rib::Preference;
+    use lr_policy::hooks::ImportHook;
+
+    struct RejectMed200;
+
+    impl ImportHook for RejectMed200 {
+        fn on_import(&self, route: &mut Route) -> HookVerdict {
+            let attrs: PathAttributes = route.attributes.clone().into();
+            if attrs.med().is_some_and(|med| med.0 == 200) {
+                HookVerdict::Drop
+            } else {
+                HookVerdict::Keep
+            }
+        }
+    }
+
+    fn router() -> (DefaultRouter, SessionHandle) {
+        let mut router = DefaultRouter::new();
+        let session = router
+            .add_session(SessionConfig::bgp(
+                Asn(64513),
+                Asn(64512),
+                RouterId::from_v4([10, 0, 0, 2]),
+            ))
+            .unwrap();
+        router
+            .set_session_soft_reconfig_inbound(session, true)
+            .unwrap();
+        (router, session)
+    }
+
+    fn route(session: SessionHandle, path_id: u32, med: u32, path: &[u32]) -> Route {
+        let mut attributes = PathAttributes::new();
+        attributes.insert(PathAttribute::new(
+            PathAttrFlags::new().set_transitive(true),
+            AttrType::Origin,
+            vec![0],
+        ));
+        attributes.insert(PathAttribute::new(
+            PathAttrFlags::new().set_transitive(true),
+            AttrType::AsPath,
+            AsPath::from_sequence(path.iter().copied().map(Asn)).encode_4(),
+        ));
+        attributes.insert(PathAttribute::new(
+            PathAttrFlags::new().set_optional(true),
+            AttrType::MultiExitDisc,
+            med.to_be_bytes().to_vec(),
+        ));
+        Route {
+            key: RouteKey::new(
+                Prefix::new_v4([203, 0, 113, 0], 24),
+                NlriFamily::IPV4_UNICAST,
+            ),
+            origin: RouteOrigin {
+                proto: 0,
+                peer: session.0,
+            },
+            protocol: Protocol::Bgp,
+            preference: Preference::new(20, path.len() as u32),
+            next_hop: Some(IpAddr::V4([192, 0, 2, 1])),
+            attributes: attributes.into(),
+            age_ms: 0,
+            path_id,
+            tag: None,
+        }
+    }
+
+    fn assert_removed(router: &DefaultRouter, session: SessionHandle) {
+        assert!(router.rib_snapshot().is_empty());
+        assert!(router.adj_rib_in.is_empty());
+        assert_eq!(router.max_prefix_state[&session.0].count, 0);
+    }
+
+    #[test]
+    fn rejected_replacement_removes_old_route_but_retains_raw_update() {
+        let (mut router, session) = router();
+        router.hooks_mut().import.push(Box::new(RejectMed200));
+        router.import_route(route(session, 0, 100, &[64512]));
+        router.poll_events();
+        router.import_route(route(session, 0, 200, &[64512]));
+        assert_removed(&router, session);
+        assert!(router
+            .poll_events()
+            .iter()
+            .any(|e| matches!(e, RouterEvent::RouteWithdrawn(_))));
+
+        let raw = router.adj_rib_in_snapshot(session);
+        assert_eq!(
+            raw.len(),
+            1,
+            "soft reconfiguration must retain the rejected update"
+        );
+        let attrs: PathAttributes = raw[0].attributes.clone().into();
+        assert_eq!(attrs.med().unwrap().0, 200);
+        router.hooks_mut().import.clear();
+        assert_eq!(router.soft_reconfig_inbound(session).unwrap(), 1);
+        assert_eq!(router.rib_len(), 1);
+    }
+
+    #[test]
+    fn accepted_replacement_keeps_count_and_emits_no_withdrawal() {
+        let (mut router, session) = router();
+        router.import_route(route(session, 0, 100, &[64512]));
+        router.poll_events();
+        router.import_route(route(session, 0, 150, &[64512]));
+        assert_eq!(router.max_prefix_state[&session.0].count, 1);
+        assert_eq!(router.adj_rib_in.len(), 1);
+        let attrs: PathAttributes = router.rib_snapshot()[0].attributes.clone().into();
+        assert_eq!(attrs.med().unwrap().0, 150);
+        assert!(router
+            .poll_events()
+            .iter()
+            .all(|e| !matches!(e, RouterEvent::RouteWithdrawn(_))));
+    }
+
+    #[test]
+    fn rejected_add_path_replacement_preserves_other_identifier() {
+        let (mut router, session) = router();
+        router.hooks_mut().import.push(Box::new(RejectMed200));
+        router.import_route(route(session, 1, 100, &[64512]));
+        router.import_route(route(session, 2, 150, &[64512, 64514]));
+        router.import_route(route(session, 1, 200, &[64512]));
+        assert_eq!(router.adj_rib_in.len(), 1);
+        assert_eq!(router.max_prefix_state[&session.0].count, 1);
+        assert_eq!(router.rib_snapshot()[0].path_id, 2);
+    }
+
+    #[test]
+    fn safety_rejection_removes_previous_accepted_route() {
+        let (mut router, session) = router();
+        router.set_safety_net(SafetyNet::new(Asn(64513)));
+        router.import_route(route(session, 0, 100, &[64512]));
+        assert_eq!(router.rib_len(), 1);
+        router.import_route(route(session, 0, 100, &[64512, 64513]));
+        assert_removed(&router, session);
+    }
+
+    #[test]
+    fn first_as_rejection_removes_previous_accepted_route() {
+        let (mut router, session) = router();
+        router.set_enforce_first_as(true);
+        router.import_route(route(session, 0, 100, &[64512]));
+        assert_eq!(router.rib_len(), 1);
+        router.import_route(route(session, 0, 100, &[64514]));
+        assert_removed(&router, session);
+    }
+
+    #[test]
+    fn rfc8212_rejection_removes_previous_accepted_route() {
+        let (mut router, session) = router();
+        router.set_ebgp_requires_policy(true);
+        router.set_session_policy(session, true, true).unwrap();
+        router.import_route(route(session, 0, 100, &[64512]));
+        assert_eq!(router.rib_len(), 1);
+        router.set_session_policy(session, false, true).unwrap();
+        router.import_route(route(session, 0, 100, &[64512]));
+        assert_removed(&router, session);
     }
 }
