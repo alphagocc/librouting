@@ -83,6 +83,15 @@ impl Lsdb {
     pub fn install(&mut self, lsa: Lsa, now_ms: u64) -> InstallOutcome {
         let key = lsa.key();
         if lsa.header.ls_age >= MAX_AGE_SECS {
+            // §13.1: MaxAge wins only after sequence and checksum ties.
+            let received = &lsa.header;
+            if self.entries.get(&key).is_some_and(|entry| {
+                let current = &entry.lsa.header;
+                (received.ls_sequence_number as i32, received.ls_checksum)
+                    < (current.ls_sequence_number as i32, current.ls_checksum)
+            }) {
+                return InstallOutcome::Ignored;
+            }
             // §13: a MaxAge instance flushes the LSA (and its watermark so
             // re-origination may restart at the initial sequence number).
             return if self.entries.remove(&key).is_some() {
@@ -289,6 +298,55 @@ mod tests {
         let mut again = make_lsa(1, 2, 0x80000003);
         again.header.ls_age = MAX_AGE_SECS;
         assert_eq!(db.install(again, 11), InstallOutcome::Ignored);
+    }
+
+    /// RFC 2328 §13.1: sequence and checksum comparisons precede the
+    /// MaxAge tie-breaker, including across the signed sequence boundary.
+    #[test]
+    fn older_max_age_cannot_purge_a_newer_instance() {
+        for (current_seq, current_sum, old_seq, old_sum) in [
+            (0x8000_0009, 0x1000, 0x8000_0008, 0xffff),
+            (0x7fff_ffff, 0x1000, 0x8000_0009, 0xffff),
+            (0x8000_0009, 0x2000, 0x8000_0009, 0x1000),
+        ] {
+            let mut db = Lsdb::new();
+            let mut current = make_lsa(1, 2, current_seq);
+            current.header.ls_checksum = current_sum;
+            db.install(current.clone(), 10);
+            let mut old = make_lsa(1, 2, old_seq);
+            old.header.ls_checksum = old_sum;
+            old.header.ls_age = MAX_AGE_SECS;
+
+            assert_eq!(db.install(old, 20), InstallOutcome::Ignored);
+            let retained = db.get(&current.key()).unwrap();
+            assert_eq!(retained.lsa, current);
+            assert_eq!(retained.installed_ms, 10);
+        }
+    }
+
+    #[test]
+    fn equally_or_more_recent_max_age_purges() {
+        for (seq, checksum) in [
+            (0x8000_0009, 0x2000),
+            (0x8000_0009, 0x3000),
+            (0x8000_000a, 0x1000),
+            (0x7fff_ffff, 0x1000),
+        ] {
+            let mut db = Lsdb::new();
+            let mut current = make_lsa(1, 2, 0x8000_0009);
+            current.header.ls_checksum = 0x2000;
+            db.install(current, 10);
+            let mut flush = make_lsa(1, 2, seq);
+            flush.header.ls_checksum = checksum;
+            flush.header.ls_age = MAX_AGE_SECS;
+
+            assert_eq!(db.install(flush, 20), InstallOutcome::Purged);
+            assert!(db.is_empty());
+            assert_eq!(
+                db.install(make_lsa(1, 2, 0x8000_0001), 30),
+                InstallOutcome::New
+            );
+        }
     }
 
     #[test]
