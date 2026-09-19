@@ -50,8 +50,8 @@ fn hold_ms(interval_cs: u16) -> u64 {
 #[derive(Default)]
 pub struct BabelRouteTable {
     routes: BTreeMap<RouteKey, BabelRoute>,
-    /// Best-known feasible (seqno, metric) per destination+source.
-    feasible: BTreeMap<(Prefix, Option<Prefix>), (u16, u32)>,
+    /// Best-known feasible (seqno, metric) per destination, source and origin.
+    feasible: BTreeMap<RouteKey, (u16, u32)>,
     /// Expiry clock per route (RFC 8966 §3.2.5).
     timing: BTreeMap<RouteKey, RouteTiming>,
 }
@@ -82,9 +82,7 @@ impl BabelRouteTable {
                 return;
             }
         }
-        let dst = route.key.destination;
-        let src = route.key.source.as_ref().map(|s| s.prefix);
-        let feas = self.feasible.get(&(dst, src)).copied();
+        let feas = self.feasible.get(&route.key).copied();
         let is_feasible = match feas {
             Some((fs, fm)) => feasible(route.seqno, route.metric, fs, fm),
             None => true,
@@ -92,13 +90,13 @@ impl BabelRouteTable {
         let mut r = route.clone();
         r.feasible = is_feasible;
         if is_feasible {
-            let prev = self.feasible.get(&(dst, src)).copied();
+            let prev = self.feasible.get(&route.key).copied();
             if prev.is_none_or(|(fs, fm)| {
                 let s_cmp = (route.seqno as i16).wrapping_sub(fs as i16);
                 s_cmp > 0 || (s_cmp == 0 && route.metric < fm)
             }) {
                 self.feasible
-                    .insert((dst, src), (route.seqno, route.metric));
+                    .insert(route.key.clone(), (route.seqno, route.metric));
             }
         }
         self.routes.insert(r.key.clone(), r);
@@ -198,13 +196,38 @@ mod tests {
         let mut t = BabelRouteTable::new();
         // First route with seqno 5 metric 100
         t.insert(make_route(5, 100, [1; 8]));
-        // Second route (different router-id) with seqno 4 metric 50 (older).
-        t.insert(make_route(4, 50, [2; 8]));
+        // An older update from the same origin remains infeasible.
+        t.insert(make_route(4, 50, [1; 8]));
         let routes = t.iter().collect::<Vec<_>>();
-        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.len(), 1);
         // The one with seqno 4 should NOT be feasible.
         let r4 = routes.iter().find(|(_, r)| r.seqno == 4).unwrap().1;
         assert!(!r4.feasible);
+    }
+
+    /// RFC 8966 §3.2.5: different origins have independent sequence
+    /// numbers, including when they advertise the same source prefix.
+    #[test]
+    fn distinct_origins_remain_feasible_after_withdrawal() {
+        for source in [
+            None,
+            Some(SourcePrefix::new(Prefix::new_v4([192, 0, 2, 0], 24))),
+        ] {
+            let mut t = BabelRouteTable::new();
+            let mut primary = make_route(100, 100, [1; 8]);
+            let mut backup = make_route(1, 200, [2; 8]);
+            primary.key.source = source.clone();
+            backup.key.source = source;
+            t.insert(primary.clone());
+            t.insert(backup.clone());
+            assert!(t.get(&backup.key).unwrap().feasible);
+            assert_eq!(t.best_routes()[0].key, primary.key);
+
+            t.withdraw(&primary.key);
+            let best = t.best_routes();
+            assert_eq!(best.len(), 1);
+            assert_eq!(best[0].key, backup.key);
+        }
     }
 
     /// RFC 8966 §3.2.5: a route expires when its hold time (6× the
