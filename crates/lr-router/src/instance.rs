@@ -1007,7 +1007,11 @@ impl BabelRuntime {
                     lr_core::addr::IpAddr::V6(_) => NlriFamily::IPV6_UNICAST,
                 };
                 Route {
-                    key: RouteKey::new(r.key.destination, family),
+                    key: RouteKey {
+                        prefix: r.key.destination,
+                        family,
+                        source: r.key.source.as_ref().map(|source| source.prefix),
+                    },
                     origin: RouteOrigin {
                         proto: 4, // Babel adjacency tag
                         peer: u64::from(u32::from_be_bytes([
