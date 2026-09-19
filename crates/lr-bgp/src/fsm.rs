@@ -948,8 +948,8 @@ impl BgpPeer {
         self.keepalive_remaining =
             u64::from(keepalive.min((self.negotiated_hold_time / 3).max(1))) * 1000;
         let mut actions = vec![];
+        self.enqueue_keepalive();
         if self.negotiated_hold_time > 0 {
-            self.enqueue_keepalive();
             actions.push(BgpAction::SetTimer(
                 timer_ids::HOLD,
                 TimerSpec::once(self.hold_remaining),
@@ -965,6 +965,7 @@ impl BgpPeer {
     /// Drive the FSM with an event; return actions to dispatch.
     pub fn step(&mut self, ev: BgpEvent) -> Vec<BgpAction> {
         let mut my_actions: Vec<BgpAction> = Vec::new();
+        let hold_enabled = self.negotiated_hold_time > 0;
         let new_state: BgpState = match (self.state, &ev) {
             (BgpState::Idle, BgpEvent::ManualStart) => {
                 my_actions.push(BgpAction::SetTimer(
@@ -997,7 +998,9 @@ impl BgpPeer {
                 }));
                 BgpState::Established
             }
-            (BgpState::Established, BgpEvent::Message(BgpMessage::Keepalive(_))) => {
+            (BgpState::Established, BgpEvent::Message(BgpMessage::Keepalive(_)))
+                if hold_enabled =>
+            {
                 self.hold_remaining = (self.negotiated_hold_time as u64) * 1000;
                 my_actions.push(BgpAction::CancelTimer(timer_ids::HOLD));
                 my_actions.push(BgpAction::SetTimer(
@@ -1021,6 +1024,9 @@ impl BgpPeer {
                     unreachable!()
                 };
                 my_actions.extend(self.handle_update_in_established(&update));
+                if !hold_enabled {
+                    return my_actions;
+                }
                 // Feasibility: re-arm the hold timer — any valid message
                 // refreshes it (RFC 4271 §4.4).
                 my_actions.push(BgpAction::CancelTimer(timer_ids::HOLD));
@@ -1030,7 +1036,7 @@ impl BgpPeer {
                 ));
                 BgpState::Established
             }
-            (BgpState::Established, BgpEvent::TimerKeepalive) => {
+            (BgpState::Established, BgpEvent::TimerKeepalive) if hold_enabled => {
                 self.enqueue_keepalive();
                 my_actions.push(BgpAction::SetTimer(
                     timer_ids::KEEPALIVE,
@@ -1038,7 +1044,7 @@ impl BgpPeer {
                 ));
                 BgpState::Established
             }
-            (BgpState::Established, BgpEvent::TimerHoldExpired) => {
+            (BgpState::Established, BgpEvent::TimerHoldExpired) if hold_enabled => {
                 self.enqueue_notification(BgpErrorCode::HoldTimerExpired, 0);
                 self.established = false;
                 my_actions.push(BgpAction::Close);
