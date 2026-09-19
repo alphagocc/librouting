@@ -878,7 +878,7 @@ impl BabelRuntime {
         // AE 0 = wildcard; AE 1 = IPv4; AE 2 = IPv6. Both are handled.
         let prefix = match u.ae {
             1 => {
-                if u.prefix.is_empty() || u.prefix.len() > 4 {
+                if u.prefix.len() > 4 {
                     return;
                 }
                 let mut addr = [0u8; 4];
@@ -886,7 +886,7 @@ impl BabelRuntime {
                 Prefix::new_v4(addr, u.prefix_len)
             }
             2 => {
-                if u.prefix.is_empty() || u.prefix.len() > 16 {
+                if u.prefix.len() > 16 {
                     return;
                 }
                 let mut addr = [0u8; 16];
