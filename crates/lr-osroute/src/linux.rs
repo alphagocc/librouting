@@ -82,6 +82,8 @@ const AF_INET6: u8 = 10;
 const NLM_F_REQUEST: u16 = 0x01;
 const NLM_F_ACK: u16 = 0x04;
 const NLM_F_DUMP: u16 = 0x300;
+const NLM_F_REPLACE: u16 = 0x100;
+const NLM_F_CREATE: u16 = 0x400;
 
 const NETLINK_ROUTE: i32 = 0;
 const AF_NETLINK: i32 = 16;
@@ -375,7 +377,7 @@ impl OsRouteTable for RtNetlink {
         let _ = (addr_len, dst_len); // for documentation
         let buf = self.build_request(
             RTM_NEWROUTE,
-            NLM_F_REQUEST | NLM_F_ACK,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
             family,
             prefix.prefix_len,
             RTPROT_BGP,
