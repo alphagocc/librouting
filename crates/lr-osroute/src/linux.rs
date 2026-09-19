@@ -402,7 +402,7 @@ impl OsRouteTable for RtNetlink {
             NLM_F_REQUEST | NLM_F_ACK,
             family,
             prefix.prefix_len,
-            0,
+            RTPROT_BGP,
             &attrs,
         );
         let resp = self.sendmsg_and_recv(&buf)?;
